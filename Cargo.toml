@@ -1,0 +1,20 @@
+[package]
+name = "cargo-manifmt"
+description = "rustfmt for your Cargo.toml."
+version = "0.1.0-pre"
+authors = ["Nikhil Benesch <nikhil.benesch@gmail.com>"]
+keywords = [
+    "fmt",
+    "format",
+    "cargo",
+    "manifest",
+]
+repository = "https://github.com/benesch/cargo-manifmt"
+categories = ["development-tools::cargo-plugins"]
+license = "Apache-2.0"
+edition = "2018"
+
+[dependencies]
+cargo = "0.41.0"
+pathdiff = "0.1.0"
+semver = "0.9.0"

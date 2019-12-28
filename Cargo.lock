@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-manifmt"
-version = "0.1.0-pre"
+version = "0.1.0"
 dependencies = [
  "cargo 0.41.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "pathdiff 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",

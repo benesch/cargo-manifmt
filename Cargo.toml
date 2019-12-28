@@ -1,7 +1,7 @@
 [package]
 name = "cargo-manifmt"
 description = "rustfmt for your Cargo.toml."
-version = "0.1.0-pre"
+version = "0.1.0"
 authors = ["Nikhil Benesch <nikhil.benesch@gmail.com>"]
 keywords = [
     "fmt",

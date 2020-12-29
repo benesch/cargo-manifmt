@@ -12,18 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::error::Error;
-use std::ffi::OsStr;
 use std::fmt::{self, Write as FmtWrite};
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use cargo::core::{Dependency, GitReference, Manifest, Target, Workspace};
+use cargo::core::compiler::CrateType;
+use cargo::core::dependency::DepKind;
 use cargo::core::manifest::TargetKind;
-use cargo::util::important_paths;
+use cargo::core::{Dependency, GitReference, Manifest, Target, Workspace};
 use cargo::util::config::Config;
+use cargo::util::important_paths;
+use cargo::util::interning::InternedString;
+use regex_macro::regex;
 use semver::VersionReq;
 
 fn main() {
@@ -39,14 +43,66 @@ fn run() -> Result<(), Box<dyn Error>> {
     let workspace = Workspace::new(&root, &config)?;
     for package in workspace.members() {
         let manifest = package.manifest();
+        let extra = parse_manifest(package.manifest_path())?;
         let mut out: Vec<u8> = vec![];
-        render_manifest(&mut out, package.root(), manifest)?;
+        render_manifest(&mut out, package.root(), manifest, &extra)?;
         fs::write(package.manifest_path(), out)?;
     }
     Ok(())
 }
 
-fn render_manifest<W>(w: &mut W, base: &Path, manifest: &Manifest) -> io::Result<()>
+fn parse_manifest(path: &Path) -> io::Result<ManifestExtra> {
+    let s = fs::read_to_string(path)?;
+
+    let comments = {
+        // WARNING: This is *really* hacky, even by cargo-manifmt standards. We
+        // should use a proper comment-preserving TOML parser here, when one is
+        // ready. See, for example, https://github.com/matklad/tom.
+        let mut comments = HashMap::new();
+        let mut current_table = String::new();
+        let mut current_comment = String::new();
+        for line in s.lines() {
+            let line = line.trim();
+            if line.starts_with("[") && line.ends_with("]") {
+                current_table = line[1..line.len() - 1].to_owned();
+            } else if line.starts_with("#") {
+                current_comment.push_str(line);
+                current_comment.push('\n');
+            } else {
+                let key: String = line
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+                    .collect();
+                if !key.is_empty() {
+                    comments.insert(
+                        format!("{}.{}", current_table, key),
+                        current_comment.clone(),
+                    );
+                }
+                current_comment.clear();
+            }
+        }
+        comments
+    };
+
+    let toml: toml::Value = toml::from_str(&s)?;
+    let package = toml.get("package").unwrap();
+    let get_auto_key = |key| package.get(key).and_then(|v| v.as_bool()).unwrap_or(true);
+    Ok(ManifestExtra {
+        autobenches: get_auto_key("autobenches"),
+        autobins: get_auto_key("autobins"),
+        autoexamples: get_auto_key("autoexamples"),
+        autotests: get_auto_key("autotests"),
+        comments,
+    })
+}
+
+fn render_manifest<W>(
+    w: &mut W,
+    base: &Path,
+    manifest: &Manifest,
+    extra: &ManifestExtra,
+) -> io::Result<()>
 where
     W: io::Write,
 {
@@ -74,7 +130,9 @@ where
         writeln!(w, "license-file = {}", TomlStr(license_file))?;
     }
     if let Some(readme) = &metadata.readme {
-        writeln!(w, "readme = {}", TomlStr(readme))?;
+        if readme != "README.md" {
+            writeln!(w, "readme = {}", TomlStr(readme))?;
+        }
     }
     if let Some(homepage) = &metadata.homepage {
         writeln!(w, "homepage = {}", TomlStr(homepage))?;
@@ -105,10 +163,17 @@ where
     if let Some(default_run) = manifest.default_run() {
         writeln!(w, "default-run = {}", TomlStr(default_run))?;
     }
-
-    if let Some(custom_metadata) = manifest.custom_metadata() {
-        writeln!(w, "\n[package.metadata]")?;
-        write!(w, "{}", custom_metadata)?;
+    if !extra.autobenches {
+        writeln!(w, "autobenches = false")?;
+    }
+    if !extra.autobins {
+        writeln!(w, "autobins = false")?;
+    }
+    if !extra.autoexamples {
+        writeln!(w, "autoexamples = false")?;
+    }
+    if !extra.autotests {
+        writeln!(w, "autotests = false")?;
     }
 
     let mut lib = None;
@@ -116,6 +181,7 @@ where
     let mut examples = vec![];
     let mut tests = vec![];
     let mut benches = vec![];
+    let mut custom_build = None;
     for target in manifest.targets() {
         match target.kind() {
             TargetKind::Lib(_) => lib = Some(target),
@@ -124,8 +190,19 @@ where
             TargetKind::Bench => benches.push(target),
             TargetKind::ExampleLib(_) => examples.push(target),
             TargetKind::ExampleBin => examples.push(target),
-            TargetKind::CustomBuild => (),
+            TargetKind::CustomBuild => custom_build = Some(target),
         }
+    }
+
+    if let Some(custom_build) = custom_build {
+        let path = rel_path(base, custom_build.src_path().path().unwrap());
+        if path != "build.rs" {
+            writeln!(w, "build = {}", TomlStr(path))?;
+        }
+    }
+
+    if let Some(toml::Value::Table(metadata)) = manifest.custom_metadata() {
+        render_metadata(w, "package.metadata", metadata)?;
     }
 
     if let Some(lib) = lib {
@@ -148,50 +225,96 @@ where
         render_target(w, base, &manifest.name(), bench)?;
     }
 
-    if !manifest.summary().features().is_empty() {
-        writeln!(w, "\n[features]")?;
-        for (name, specs) in manifest.summary().features() {
-            let value: Vec<_> = specs.iter().map(|s| s.to_string(manifest.summary())).collect();
-            writeln!(w, "{} = {}", name, TomlFlatArray(&value))?;
-        }
-    }
-
-    let mut deps = vec![];
+    let mut deps: BTreeMap<_, Vec<&Dependency>> = BTreeMap::new();
     let mut dev_deps = vec![];
     let mut build_deps = vec![];
     for dep in manifest.dependencies() {
-        use cargo::core::dependency::Kind;
         match dep.kind() {
-            Kind::Normal => deps.push(dep),
-            Kind::Development => dev_deps.push(dep),
-            Kind::Build => build_deps.push(dep),
+            DepKind::Normal => {
+                deps.entry(dep.platform()).or_default().push(dep);
+            }
+            DepKind::Development => dev_deps.push(dep),
+            DepKind::Build => build_deps.push(dep),
         }
     }
-    deps.sort_by_key(|dep| dep.name_in_toml());
-    dev_deps.sort_by_key(|dep| dep.name_in_toml());
-    build_deps.sort_by_key(|dep| dep.name_in_toml());
 
-    if !deps.is_empty() {
-        writeln!(w, "\n[dependencies]")?;
-        for dep in deps {
-            render_dependency(w, base, dep)?;
+    for (platform, mut deps) in deps {
+        if !deps.is_empty() {
+            if let Some(platform) = platform {
+                writeln!(w, "\n[target.{}.dependencies]", TomlStr(platform))?;
+            } else {
+                writeln!(w, "\n[dependencies]")?;
+            }
+            deps.sort_by_key(|dep| dep.name_in_toml());
+            for dep in deps {
+                render_dependency(w, base, dep, extra)?;
+            }
         }
     }
 
     if !dev_deps.is_empty() {
         writeln!(w, "\n[dev-dependencies]")?;
+        dev_deps.sort_by_key(|dep| dep.name_in_toml());
         for dep in dev_deps {
-            render_dependency(w, base, dep)?;
+            render_dependency(w, base, dep, extra)?;
         }
     }
 
     if !build_deps.is_empty() {
         writeln!(w, "\n[build-dependencies]")?;
+        build_deps.sort_by_key(|dep| dep.name_in_toml());
         for dep in build_deps {
-            render_dependency(w, base, dep)?;
+            render_dependency(w, base, dep, extra)?;
         }
     }
 
+    if !manifest.summary().features().is_empty() {
+        writeln!(w, "\n[features]")?;
+        for (name, specs) in manifest.summary().features() {
+            let value: Vec<_> = specs
+                .iter()
+                .map(|s| s.to_string(manifest.summary()))
+                .collect();
+            if let Some(comment) = extra.comments.get(&format!("features.{}", name)) {
+                write!(w, "{}", comment)?;
+            }
+            writeln!(w, "{} = {}", name, TomlFlatArray(&value))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn render_metadata<W>(w: &mut W, key_prefix: &str, metadata: &toml::value::Table) -> io::Result<()>
+where
+    W: io::Write,
+{
+    let mut non_table_buf = Vec::new();
+    let mut table_buf = Vec::new();
+
+    for (key, value) in metadata {
+        match value {
+            toml::Value::Table(table) => {
+                let new_prefix = format!("{}.{}", key_prefix, key);
+                render_metadata(&mut table_buf, &new_prefix, table)?;
+            }
+            toml::Value::Array(array) => {
+                let mut s = format!("{} = {}", key, TomlFlatArray(array));
+                if s.len() > 100 {
+                    s = format!("{} = {}", key, TomlPrettyArray(array));
+                }
+                writeln!(non_table_buf, "{}", s)?;
+            }
+            _ => writeln!(non_table_buf, "{} = {}", key, value)?,
+        }
+    }
+
+    if !non_table_buf.is_empty() {
+        writeln!(w, "\n[{}]", key_prefix)?;
+        w.write(&non_table_buf)?;
+    }
+
+    w.write(&table_buf)?;
     Ok(())
 }
 
@@ -203,28 +326,32 @@ where
     let path = rel_path(base, target.src_path().path().unwrap());
     let at_std_path = match target.kind() {
         TargetKind::Lib(_) => path == "src/lib.rs",
-        TargetKind::Bin => path == "src/main.rs" || path == format!("src/bin/{}.rs", target.name()),
-        TargetKind::Test => path == format!("tests/{}/main.rs", target.name()) || path == format!("tests/{}.rs", target.name()),
-        TargetKind::Bench => path == format!("benches/{}/main.rs", target.name()) || path == format!("benches/{}.rs", target.name()),
-        TargetKind::ExampleLib(_) | TargetKind::ExampleBin => path == format!("examples/{}/main.rs", target.name()) || path == format!("examples/{}.rs", target.name()),
+        TargetKind::Bin => {
+            path == "src/main.rs"
+                || path == format!("src/bin/{}/main.rs", target.name())
+                || path == format!("src/bin/{}.rs", target.name())
+        }
+        TargetKind::Test => {
+            path == format!("tests/{}/main.rs", target.name())
+                || path == format!("tests/{}.rs", target.name())
+        }
+        TargetKind::Bench => {
+            path == format!("benches/{}/main.rs", target.name())
+                || path == format!("benches/{}.rs", target.name())
+        }
+        TargetKind::ExampleLib(_) | TargetKind::ExampleBin => {
+            path == format!("examples/{}/main.rs", target.name())
+                || path == format!("examples/{}.rs", target.name())
+        }
         _ => false,
     };
-    let path_name = {
-        let path = Path::new(&path);
-        if path.file_stem().unwrap() != "main" {
-            path.file_stem().unwrap_or(OsStr::new(""))
-        } else {
-            path.parent().unwrap_or(Path::new("")).file_name().unwrap_or(OsStr::new(""))
+    if let TargetKind::Lib(crate_types) = target.kind() {
+        for crate_type in crate_types {
+            match crate_type {
+                CrateType::ProcMacro => writeln!(buf, "proc-macro = true")?,
+                _ => (),
+            }
         }
-    }.to_string_lossy().into_owned();
-    let inferred_name = match target.kind() {
-        TargetKind::Lib(_) => package_name,
-        TargetKind::Bin if path == "src/main.rs" => package_name,
-        TargetKind::Test | TargetKind::ExampleLib(_) | TargetKind::ExampleBin if at_std_path => &path_name,
-        _ => "",
-    };
-    if target.name() != inferred_name {
-        writeln!(buf, "name = {}", TomlStr(target.name()))?;
     }
     if !at_std_path {
         writeln!(buf, "path = {}", TomlStr(path))?;
@@ -236,27 +363,50 @@ where
         writeln!(buf, "doc = false")?;
     }
     if !buf.is_empty() {
-        writeln!(w, "\n[{}]", match target.kind() {
-            TargetKind::Lib(_) => "lib",
-            TargetKind::Bin => "[bin]",
-            TargetKind::Test => "[test]",
-            TargetKind::Bench => "[bench]",
-            TargetKind::ExampleLib(_) | TargetKind::ExampleBin => "[example]",
-            TargetKind::CustomBuild => unreachable!(),
-        })?;
+        writeln!(
+            w,
+            "\n[{}]",
+            match target.kind() {
+                TargetKind::Lib(_) => "lib",
+                TargetKind::Bin => "[bin]",
+                TargetKind::Test => "[test]",
+                TargetKind::Bench => "[bench]",
+                TargetKind::ExampleLib(_) | TargetKind::ExampleBin => "[example]",
+                TargetKind::CustomBuild => unreachable!(),
+            }
+        )?;
+        if !(target.is_lib() && target.name() == package_name) {
+            writeln!(w, "name = {}", TomlStr(target.name()))?;
+        }
         w.write(&buf)?;
     }
     Ok(())
 }
 
-fn render_dependency<W>(w: &mut W, base: &Path, dep: &Dependency) -> io::Result<()>
+fn render_dependency<W>(
+    w: &mut W,
+    base: &Path,
+    dep: &Dependency,
+    extra: &ManifestExtra,
+) -> io::Result<()>
 where
     W: io::Write,
 {
+    let toml_key = match dep.platform() {
+        None => format!("dependencies.{}", dep.name_in_toml()),
+        Some(platform) => format!(
+            "target.{}.dependencies.{}",
+            TomlStr(platform),
+            dep.name_in_toml()
+        ),
+    };
+    if let Some(comment) = extra.comments.get(&toml_key) {
+        write!(w, "{}", comment)?;
+    }
     write!(w, "{} = ", dep.name_in_toml())?;
     let mut meta: Vec<(&'static str, Box<dyn fmt::Display>)> = vec![];
     if dep.package_name() != dep.name_in_toml() {
-        meta.push(("package", Box::new(dep.package_name())));
+        meta.push(("package", Box::new(TomlStr(dep.package_name()))));
     }
     let source_id = dep.source_id();
     if source_id.is_path() {
@@ -266,7 +416,9 @@ where
         meta.push(("git", Box::new(TomlStr(source_id.url().clone()))));
         match git_ref {
             GitReference::Tag(tag) => meta.push(("tag", Box::new(TomlStr(tag)))),
-            GitReference::Branch(branch) if branch != "master" => meta.push(("branch", Box::new(TomlStr(branch)))),
+            GitReference::Branch(branch) if branch != "master" => {
+                meta.push(("branch", Box::new(TomlStr(branch))))
+            }
             GitReference::Rev(rev) => meta.push(("rev", Box::new(TomlStr(rev)))),
             _ => (),
         }
@@ -278,7 +430,7 @@ where
         meta.push(("features", Box::new(TomlFlatArray(dep.features()))));
     }
     if dep.is_optional() {
-        meta.push(("optional", Box::new("false")));
+        meta.push(("optional", Box::new("true")));
     }
     if meta.is_empty() {
         write!(w, "{}\n", TomlVersion(dep.version_req()))?;
@@ -286,13 +438,31 @@ where
         if dep.version_req().to_string() != "*" {
             meta.insert(0, ("version", Box::new(TomlVersion(dep.version_req()))));
         }
-        write!(w, "{{ {} }}\n", meta.iter().map(|(k, v)| format!("{} = {}", k, v)).collect::<Vec<_>>().join(", "))?;
+        write!(
+            w,
+            "{{ {} }}\n",
+            meta.iter()
+                .map(|(k, v)| format!("{} = {}", k, v))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )?;
     }
     Ok(())
 }
 
 fn rel_path(base: &Path, path: impl AsRef<Path>) -> String {
-    pathdiff::diff_paths(path.as_ref(), base).unwrap().to_string_lossy().into_owned()
+    pathdiff::diff_paths(path.as_ref(), base)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
+struct ManifestExtra {
+    autobenches: bool,
+    autobins: bool,
+    autoexamples: bool,
+    autotests: bool,
+    comments: HashMap<String, String>,
 }
 
 struct TomlStr<S>(S);
@@ -302,8 +472,93 @@ where
     S: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.to_string().fmt_toml(f)
+    }
+}
+
+struct TomlFlatArray<'a, S>(&'a [S]);
+
+impl<'a, S> fmt::Display for TomlFlatArray<'a, S>
+where
+    S: TomlDisplay,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_char('[')?;
+        for (i, s) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            s.fmt_toml(f)?;
+        }
+        f.write_char(']')
+    }
+}
+
+struct TomlPrettyArray<'a, S>(&'a [S]);
+
+impl<'a, S> fmt::Display for TomlPrettyArray<'a, S>
+where
+    S: TomlDisplay,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_char('[')?;
+        if self.0.len() > 1 {
+            f.write_char('\n')?;
+        }
+        for s in self.0 {
+            if self.0.len() > 1 {
+                f.write_str("    ")?;
+            }
+            s.fmt_toml(f)?;
+            if self.0.len() > 1 {
+                f.write_str(",\n")?;
+            }
+        }
+        f.write_char(']')
+    }
+}
+
+struct TomlVersion<'a>(&'a VersionReq);
+
+impl<'a> fmt::Display for TomlVersion<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = self.0.to_string();
+        let version_regex =
+            regex!(r#"\^(?P<major>[0-9]+)(\.(?P<minor>[0-9]+)(\.(?P<patch>[0-9]+))?)?"#);
+        if let Some(caps) = version_regex.captures(&s) {
+            write!(
+                f,
+                "\"{}.{}.{}\"",
+                caps.name("major").map_or("0", |m| m.as_str()),
+                caps.name("minor").map_or("0", |m| m.as_str()),
+                caps.name("patch").map_or("0", |m| m.as_str())
+            )
+        } else {
+            write!(f, "{}", TomlStr(s))
+        }
+    }
+}
+
+trait TomlDisplay {
+    fn fmt_toml(&self, f: &mut fmt::Formatter) -> fmt::Result;
+}
+
+impl TomlDisplay for toml::Value {
+    fn fmt_toml(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl TomlDisplay for &str {
+    fn fmt_toml(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if self.contains('"') && !self.contains('\'') {
+            f.write_char('\'')?;
+            f.write_str(self)?;
+            return f.write_char('\'');
+        }
+
         f.write_char('\"')?;
-        for ch in self.0.to_string().chars() {
+        for ch in self.chars() {
             match ch {
                 '\u{8}' => f.write_str("\\b")?,
                 '\u{9}' => f.write_str("\\t")?,
@@ -320,53 +575,14 @@ where
     }
 }
 
-struct TomlFlatArray<'a, S>(&'a [S]);
-
-impl<'a, S> fmt::Display for TomlFlatArray<'a, S>
-where
-    S: fmt::Display,
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_char('[')?;
-        for (i, s) in self.0.iter().enumerate() {
-            if i > 0 {
-                f.write_str(", ")?;
-            }
-            write!(f, "{}", TomlStr(s))?;
-        }
-        f.write_char(']')
+impl TomlDisplay for String {
+    fn fmt_toml(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.as_str().fmt_toml(f)
     }
 }
 
-struct TomlPrettyArray<'a, S>(&'a [S]);
-
-impl<'a, S> fmt::Display for TomlPrettyArray<'a, S>
-where
-    S: fmt::Display,
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_char('[')?;
-        if self.0.len() > 1 {
-            f.write_char('\n')?;
-        }
-        for s in self.0 {
-            if self.0.len() > 1 {
-                f.write_str("    ")?;
-            }
-            write!(f, "{}", TomlStr(s))?;
-            if self.0.len() > 1 {
-                f.write_str(",\n")?;
-            }
-        }
-        f.write_char(']')
-    }
-}
-
-struct TomlVersion<'a>(&'a VersionReq);
-
-impl<'a> fmt::Display for TomlVersion<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let s = self.0.to_string();
-        write!(f, "{}", TomlStr(s.trim_start_matches("^")))
+impl TomlDisplay for InternedString {
+    fn fmt_toml(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.as_str().fmt_toml(f)
     }
 }

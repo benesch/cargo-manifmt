@@ -27,7 +27,7 @@ no configuration options.
 
 ## Features
 
-* Sorts Package metadata into a consistent order that places the most important
+* Sorts package metadata into a consistent order that places the most important
   keys at the time.
 * Sorts dependencies alphabetically within each group.
 * Rewrites standard "caret" version contraints to be fully-specified, e.g.,

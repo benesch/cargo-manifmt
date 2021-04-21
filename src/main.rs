@@ -271,7 +271,16 @@ where
     if !manifest.summary().features().is_empty() {
         writeln!(w, "\n[features]")?;
         for (name, specs) in manifest.summary().features() {
-            let value: Vec<_> = specs.iter().map(|s| s.to_string()).collect();
+            let value: Vec<_> = specs
+                .iter()
+                .map(|s| {
+                    let s = s.to_string();
+                    match s.strip_prefix("dep:") {
+                        None => s,
+                        Some(s) => s.to_owned(),
+                    }
+                })
+                .collect();
             if let Some(comment) = extra.comments.get(&format!("features.{}", name)) {
                 write!(w, "{}", comment)?;
             }

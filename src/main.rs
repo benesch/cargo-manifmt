@@ -271,10 +271,7 @@ where
     if !manifest.summary().features().is_empty() {
         writeln!(w, "\n[features]")?;
         for (name, specs) in manifest.summary().features() {
-            let value: Vec<_> = specs
-                .iter()
-                .map(|s| s.to_string(manifest.summary()))
-                .collect();
+            let value: Vec<_> = specs.iter().map(|s| s.to_string()).collect();
             if let Some(comment) = extra.comments.get(&format!("features.{}", name)) {
                 write!(w, "{}", comment)?;
             }

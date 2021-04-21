@@ -268,19 +268,25 @@ where
         }
     }
 
-    if !manifest.summary().features().is_empty() {
+    let mut features = HashMap::new();
+    for (name, specs) in manifest.summary().features() {
+        let value: Vec<_> = specs
+            .iter()
+            .map(|s| {
+                let s = s.to_string();
+                match s.strip_prefix("dep:") {
+                    None => s,
+                    Some(s) => s.to_owned(),
+                }
+            })
+            .collect();
+        if value.len() != 1 || value[0] != name.as_str() {
+            features.insert(name, value);
+        }
+    }
+    if !features.is_empty() {
         writeln!(w, "\n[features]")?;
-        for (name, specs) in manifest.summary().features() {
-            let value: Vec<_> = specs
-                .iter()
-                .map(|s| {
-                    let s = s.to_string();
-                    match s.strip_prefix("dep:") {
-                        None => s,
-                        Some(s) => s.to_owned(),
-                    }
-                })
-                .collect();
+        for (name, value) in features {
             if let Some(comment) = extra.comments.get(&format!("features.{}", name)) {
                 write!(w, "{}", comment)?;
             }

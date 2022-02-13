@@ -27,8 +27,8 @@ use cargo::core::{Dependency, GitReference, Manifest, Target, Workspace};
 use cargo::util::config::Config;
 use cargo::util::important_paths;
 use cargo::util::interning::InternedString;
+use cargo::util::OptVersionReq;
 use regex_macro::regex;
-use semver::VersionReq;
 
 fn main() {
     if let Err(err) = run() {
@@ -153,6 +153,9 @@ where
         writeln!(w, "links = {}", TomlStr(links))?;
     }
     writeln!(w, "edition = {}", TomlStr(&manifest.edition().to_string()))?;
+    if let Some(rust_version) = manifest.rust_version() {
+        writeln!(w, "rust-version = {}", TomlStr(&rust_version))?;
+    }
     if let Some(publish) = manifest.publish() {
         if publish.is_empty() {
             writeln!(w, "publish = false")?;
@@ -530,7 +533,7 @@ where
     }
 }
 
-struct TomlVersion<'a>(&'a VersionReq);
+struct TomlVersion<'a>(&'a OptVersionReq);
 
 impl<'a> fmt::Display for TomlVersion<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

@@ -2,7 +2,7 @@
 name = "cargo-manifmt"
 description = "rustfmt for your Cargo.toml."
 readme = "README.md"
-version = "0.1.5-alpha.0"
+version = "0.1.5"
 authors = ["Nikhil Benesch <nikhil.benesch@gmail.com>"]
 keywords = [
     "fmt",

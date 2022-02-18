@@ -1,7 +1,6 @@
 [package]
 name = "cargo-manifmt"
 description = "rustfmt for your Cargo.toml."
-readme = "README.md"
 version = "0.1.5"
 authors = ["Nikhil Benesch <nikhil.benesch@gmail.com>"]
 keywords = [
@@ -10,14 +9,14 @@ keywords = [
     "cargo",
     "manifest",
 ]
-repository = "https://github.com/benesch/cargo-manifmt"
 categories = ["development-tools::cargo-plugins"]
 license = "Apache-2.0"
+repository = "https://github.com/benesch/cargo-manifmt"
 edition = "2018"
 
 [dependencies]
 cargo = "0.59.0"
 pathdiff = "0.1.0"
-regex = "1.0"
+regex = "1.0.0"
 regex-macro = "0.1.1"
 toml = "0.5.8"
